@@ -1,80 +1,109 @@
 package com
 
 import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
-import akka.actor.typed.{ActorRef, Behavior}
-import com.typesafe.config.{Config, ConfigFactory}
+import akka.actor.typed.{ActorRef, Behavior, PostStop, PreRestart, SupervisorStrategy}
+import akka.persistence.typed.PersistenceId
+import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
+import com.typesafe.config.Config
 
+import scala.concurrent.duration.DurationInt
 import scala.util.matching.Regex
-import scala.util.{Failure, Success, Try}
 
 object PaymentChecker {
 
-  // Протокол
-  case class CheckPayment(payment: String)
+  final case class Transaction(from: String, to: String, value: Long) {
+    override def toString: String = s"| $from -> $to : $value |"
+  }
 
-  // Поведение
-  def apply(): Behavior[CheckPayment] = Behaviors.setup { context =>
+  sealed trait Command
+  case class CheckPayment(payment: String)                                           extends Command
+  case class ConfirmAdded(to: String, payment: PaymentParticipant.Payment)           extends Command
+  case class FinishPayment(participant: String, payment: PaymentParticipant.Payment) extends Command
+
+  sealed trait Event
+  case class CheckedPayment(transaction: Transaction)                                  extends Event
+  case class MoneyAdded(to: String, payment: PaymentParticipant.Payment)               extends Event
+  case class FinishedPayment(participant: String, payment: PaymentParticipant.Payment) extends Event
+
+  final case class State(
+    logIncorrectPayment: ActorRef[LogIncorrectPayment.Command],
+    maskPayment: Regex,
+    balance: Long,
+    activeParticipants: Map[String, ActorRef[PaymentParticipant.Command]] = Map()) {
+
+    def addParticipants(
+      name1: String,
+      actor1: ActorRef[PaymentParticipant.Command],
+      name2: String,
+      actor2: ActorRef[PaymentParticipant.Command]
+    ) = copy(activeParticipants = activeParticipants + (name1 -> actor1) + (name2 -> actor2))
+
+    def finishedPayment(name1: String, name2: String) = copy(activeParticipants = activeParticipants - name1 - name2)
+
+    def nowInTransaction(participant: String): Boolean = activeParticipants.contains(participant)
+  }
+
+  def apply(config: Config): Behavior[Command] = Behaviors.setup { context: ActorContext[Command] =>
     val logIncorrectPayment = context.spawn(LogIncorrectPayment(), "logIncorrectPayment")
-    val children: Map[String, ActorRef[PaymentParticipant.Event]] = Map() // хранение акторов-участников для удаления после платежа
 
-    val config: Config = ConfigFactory.load()
     val maskPayment = config.getString("app.maskPayment").r
-    val balance = config.getString("app.balance").toLong // стд баланс для всех акторов
+    val balance     = config.getLong("app.balance")
 
-    receiveCheckPayment(logIncorrectPayment, children, maskPayment, balance) // возвращаем поведение приёма платежей
+    EventSourcedBehavior(
+      PersistenceId.ofUniqueId("paymentChecker"),
+      State(logIncorrectPayment, maskPayment, balance),
+      commandHandler,
+      eventHandler(context)
+    ).snapshotWhen((_, _, _) => true)
+      .receiveSignal{
+        case (_, PostStop) => context.log.info(s"PostStop: paymentChecker")
+        case (_, PreRestart) => context.log.info(s"PreRestart: paymentChecker")
+      }
+      .onPersistFailure(SupervisorStrategy.restartWithBackoff(3.seconds, 30.seconds, 0.2))
   }
 
-  // Принятие сообщений CheckPayment
-  def receiveCheckPayment(logIncorrectPayment: ActorRef[LogIncorrectPayment.IncorrectPayment],
-                          children: Map[String, ActorRef[PaymentParticipant.Event]],
-                          maskPayment: Regex,
-                          balance: Long): Behavior[CheckPayment] = Behaviors.receive { (context, checkPayment) =>
+  def commandHandler: (State, Command) => Effect[Event, State] = { (state, command) =>
+    command match {
+      case CheckPayment(state.maskPayment(from, _, to, _, _))
+          if state.nowInTransaction(from) || state.nowInTransaction(to) =>
+        Effect.stash()
 
-    Try {
-      val maskPayment(participant1name, _, participant2name, _, count) = checkPayment.payment // разбираем строку платежа по образцам
-      (participant1name, participant2name, count.toLong)
+      case CheckPayment(state.maskPayment(from, _, to, _, value)) =>
+        Effect.persist[Event, State](CheckedPayment(Transaction(from, to, value.toLong)))
+
+      case ConfirmAdded(whomAdded, payment) => Effect.persist[Event, State](MoneyAdded(whomAdded, payment))
+
+      case FinishPayment(participant, payment) =>
+        Effect.persist[Event, State](FinishedPayment(participant, payment)).thenUnstashAll()
+
+      case CheckPayment(payment) => incorrectPayment(payment)
     }
-    match {
-      case Success((participant1name, participant2name, count)) =>
-        val (participant1Actor, participant2Actor) = getOrCreateActorsParticipants(context, children, (participant1name, participant2name), balance)
-        tellPayments(participant1Actor, participant2Actor, count) // отправляем акторам сообщение Payment
-        val newChildren = refreshChildren(children, (participant1Actor, participant2Actor)) // обновляем Map с акторами
-        receiveCheckPayment(logIncorrectPayment, newChildren, maskPayment, balance) // изменяем поведение с обновлённым newChildren
+  }
 
-      case Failure(exception) => // неудовлетворение маске платежа
-        logIncorrectPayment ! LogIncorrectPayment.IncorrectPayment(exception.getMessage) // логируем некорректность
-        Behaviors.same // и оставляем пред. поведение с намотанными акторами
+  def eventHandler(context: ActorContext[Command]): (State, Event) => State = { (newState, event) =>
+    event match {
+      case CheckedPayment(transaction @ Transaction(from, to, value)) =>
+        context.log.info(s"НАЧАТА ТРАНЗАКЦИЯ: $transaction")
+        def spawn(name: String) = context.spawn(
+          Behaviors
+            .supervise(PaymentParticipant(name, newState.balance))
+            .onFailure(SupervisorStrategy.restartWithBackoff(3.seconds, 30.seconds, randomFactor = 0.2)),
+          name
+        )
+        val (fromActor, toActor) = (spawn(from), spawn(to))
+        toActor ! PaymentParticipant.Payment(PaymentParticipant.PaymentSign("+"), value, fromActor, context.self)
+        newState.addParticipants(from, fromActor, to, toActor)
+
+      case MoneyAdded(whomAdded, payment) =>
+        val from: ActorRef[PaymentParticipant.Command] = payment.participant
+        val to: ActorRef[PaymentParticipant.Command]   = newState.activeParticipants(whomAdded)
+        from ! PaymentParticipant.Payment(PaymentParticipant.PaymentSign("-"), payment.value, to, context.self)
+        newState
+
+      case FinishedPayment(whomAdded, payment) => newState.finishedPayment(whomAdded, payment.participant.path.name)
     }
   }
 
-  def getOrCreateActorsParticipants(context: ActorContext[CheckPayment],
-                                    children: Map[String, ActorRef[PaymentParticipant.Event]],
-                                    participantsNames: (String, String),
-                                    balance: Long
-                              ): (ActorRef[PaymentParticipant.Event], ActorRef[PaymentParticipant.Event]) = {
-    // получаем актор если есть, иначе создаём его. Возвращаем пару акторов
-    val participant1 = children.getOrElse(participantsNames._1, context.spawn(PaymentParticipant(balance), participantsNames._1))
-    val participant2 = children.getOrElse(participantsNames._2, context.spawn(PaymentParticipant(balance), participantsNames._2))
-
-    (participant1, participant2)
-  }
-
-  def refreshChildren(children: Map[String, ActorRef[PaymentParticipant.Event]],
-                      participants: (ActorRef[PaymentParticipant.Event], ActorRef[PaymentParticipant.Event])
-                     ): Map[String, ActorRef[PaymentParticipant.Event]] = {
-
-    children + (participants._1.path.name -> participants._1) + (participants._2.path.name -> participants._2)
-  }
-
-  def tellPayments(participant1Actor: ActorRef[PaymentParticipant.Event],
-                   participant2Actor: ActorRef[PaymentParticipant.Event],
-                   count: Long
-                  ): Unit = {
-
-    participant1Actor ! PaymentParticipant.Payment(PaymentParticipant.PaymentSign("-"), count, participant2Actor)
-    participant2Actor ! PaymentParticipant.Payment(PaymentParticipant.PaymentSign("+"), count, participant1Actor)
-
-    // КАК ТОЛЬКО ОБА ВЕРНУТ ОТВЕТ (значит платёж с обоих сторон обработан) - УДАЛИТЬ ИХ
-    // И стратегию супервизора при падении акторов
-  }
+  def incorrectPayment(payment: String): Effect[Event, State] =
+    Effect.unhandled.thenRun(state => state.logIncorrectPayment ! LogIncorrectPayment.IncorrectPayment(payment))
 }

@@ -3,19 +3,15 @@ package com
 import akka.actor.typed.Behavior
 import akka.actor.typed.scaladsl.Behaviors
 
-/**
- * Актор записывает в лог сообщение о некорректном переводе
- */
-
 object LogIncorrectPayment {
-  /**
-   * Сообщения
-   */
-  case class IncorrectPayment(error: String)
 
-  def apply(): Behavior[IncorrectPayment] = Behaviors.receive { (context, message) =>
-    context.log.error(message.error)
+  sealed trait Command
+  case class IncorrectPayment(error: String) extends Command
+
+  def apply(): Behavior[Command] = Behaviors.receive { (context, message) =>
+    message match {
+      case IncorrectPayment(error) => context.log.info(s"Некорректный платёж: $error")
+    }
     Behaviors.same
   }
-
 }
