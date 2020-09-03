@@ -6,7 +6,7 @@
 В конфигурационном файле application.conf (src/main/resources/application.conf), в дереве akka, указать следующие свойства:
 ```
 app {
-  catalog = "C:\\Users\\danel\\Music\\files" # папка с файлами переводов
+  catalog = "D:\\payments" # папка с файлами переводов
   maskFile = "file[0-9]+.txt" # маска файлов
   maskPayment = "([A-Za-z0-9]+) (->) ([A-Za-z0-9]+) (:) ([0-9]+)" # маска перевода
   balance = 500 #  Начальный баланс для всех счетов
